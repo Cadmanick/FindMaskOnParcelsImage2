@@ -30,7 +30,7 @@ class MaskFinderGUI:
         # Default paths
         root_dir = os.path.dirname(os.path.abspath(__file__))
         default_mask_path = os.path.join(root_dir, "ExportedScaledMask.tif")
-        default_target_path = os.path.join(root_dir, "Southport[600dpi].tif")
+        default_target_path = os.path.join(root_dir, "Southport[96dpi].tif")
 
         # Entry fields for image paths
         self.mask_path_entry = Entry(root, width=120)
