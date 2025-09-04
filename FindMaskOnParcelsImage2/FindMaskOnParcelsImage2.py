@@ -76,8 +76,6 @@ class MaskFinderGUI:
         self.load_mask_btn = Button(root, text="2-Load Mask Image", command=self.load_mask_image)
         self.load_mask_btn.pack(side=tk.LEFT, padx=5, pady=5)
 
-        # self.preprocess_btn = Button(root, text="Preprocess Target (Contours & Thicken)", command=self.preprocess_target_image)
-        # self.preprocess_btn.pack(side=tk.LEFT, padx=5, pady=5)
         self.find_btn = Button(root, text="3-Find Mask Candidates", command=self.find_and_highlight_mask_candidates)
         self.find_btn.pack(side=tk.LEFT, padx=5, pady=5)
         self.zoom_extents_btn = Button(root, text="Zoom to Extents", command=self.zoom_to_extents)
@@ -90,13 +88,6 @@ class MaskFinderGUI:
         self.threshold_entry = Entry(root)
         self.threshold_entry.pack(side=tk.TOP, padx=5, pady=2)
         self.threshold_entry.insert(0, "0.8")  # Default threshold
-
-        # Method selection
-        # self.method_var = tk.StringVar(value="TM_CCOEFF_NORMED")
-        # methods = ["TM_CCOEFF_NORMED", "TM_SQDIFF_NORMED", "TM_CCORR_NORMED"]
-        # for method in methods:
-        #     radiobutton = tk.Radiobutton(root, text=method, variable=self.method_var, value=method)
-        #     radiobutton.pack(side=tk.TOP, padx=5, pady=2)
 
         # Bind zoom and pan events
         self.canvas.bind("<MouseWheel>", self.zoom_event)  # Windows
@@ -111,7 +102,7 @@ class MaskFinderGUI:
         self.canvas.bind("<ButtonRelease-1>", self.end_pan_shift)
 
     def show_image(self, img):
-        """Display the current image with zoom and pan."""
+        """Display the current image with zoom and pan, and overlay mask in visible viewport at correct scale."""
         if img is None:
             return
         self.display_img = img
@@ -128,6 +119,27 @@ class MaskFinderGUI:
         if cropped.shape[0] == 0 or cropped.shape[1] == 0:
             return
         resized = cv2.resize(cropped, (self.canvas_width, self.canvas_height), interpolation=cv2.INTER_AREA)
+
+        # Overlay mask in bottom right of the visible canvas, scaled by current zoom
+        if self.mask_img is not None:
+            mask_h, mask_w = self.mask_img.shape[:2]
+            scaled_mask_h = int(mask_h * self.zoom)
+            scaled_mask_w = int(mask_w * self.zoom)
+            overlay_h = min(scaled_mask_h, self.canvas_height)
+            overlay_w = min(scaled_mask_w, self.canvas_width)
+            mask_resized = cv2.resize(self.mask_img, (overlay_w, overlay_h), interpolation=cv2.INTER_NEAREST)
+            colored_mask = np.zeros((overlay_h, overlay_w, 3), dtype=np.uint8)
+            colored_mask[:, :, 2] = mask_resized
+            alpha = 0.5
+            y_offset = self.canvas_height - overlay_h
+            x_offset = self.canvas_width - overlay_w
+            roi = resized[y_offset:y_offset+overlay_h, x_offset:x_offset+overlay_w].astype(np.float32)
+            # Only blend where mask is nonzero
+            mask_fg = mask_resized > 0
+            blended = roi.copy()
+            blended[mask_fg] = roi[mask_fg] * (1 - alpha) + colored_mask[mask_fg].astype(np.float32) * alpha
+            resized[y_offset:y_offset+overlay_h, x_offset:x_offset+overlay_w] = blended.astype(np.uint8)
+
         # Convert for Tkinter
         if len(resized.shape) == 2:
             preview_rgb = cv2.cvtColor(resized, cv2.COLOR_GRAY2RGB)
@@ -157,7 +169,7 @@ class MaskFinderGUI:
         if self.target_img is not None:
             target_path = self.target_path_entry.get()
             self.mask_img = scale_mask_to_target(file_path, target_path)
-            self.overlay_mask_bottom_right()  # <-- Overlay mask after scaling
+            #self.overlay_mask_bottom_right()  # <-- Overlay mask after scaling
         else:
             self.mask_img = cv2.imread(file_path, cv2.IMREAD_GRAYSCALE)
             if self.mask_img is not None:
@@ -311,8 +323,8 @@ class MaskFinderGUI:
         else:
             self.status_label.config(text=f"Found {match_count} compound match(es) (threshold={match_thresh}, size tolerance={tolerance*100:.0f}%)")
 
-    def overlay_mask_bottom_right_with_opacity(self, base_img, mask_img, opacity=0.2):
-        """Overlay mask_img in bottom right corner of base_img with given opacity."""
+    def overlay_mask_bottom_right_with_transparency(self, base_img, mask_img):
+        """Overlay mask_img in bottom right corner of base_img using mask as transparency."""
         if base_img is None or mask_img is None:
             return base_img
         mask_h, mask_w = mask_img.shape[:2]
@@ -321,11 +333,23 @@ class MaskFinderGUI:
         x_offset = base_w - mask_w
         if y_offset < 0 or x_offset < 0:
             return base_img  # Mask too large
-        # Prepare colored mask
+
+        # Prepare colored mask (red channel)
         colored_mask = np.zeros((mask_h, mask_w, 3), dtype=np.uint8)
         colored_mask[:, :, 2] = mask_img  # Red channel
-        roi = base_img[y_offset:y_offset+mask_h, x_offset:x_offset+mask_w]
-        blended = cv2.addWeighted(roi, 1-opacity, colored_mask, opacity, 0)
+
+        # Normalize mask to [0,1] for alpha channel
+        alpha_mask = mask_img.astype(np.float32) / 255.0
+        alpha_mask = np.expand_dims(alpha_mask, axis=2)  # shape (h, w, 1)
+
+        # Get ROI from base image
+        roi = base_img[y_offset:y_offset+mask_h, x_offset:x_offset+mask_w].astype(np.float32)
+
+        # Blend only where mask is nonzero (foreground)
+        blended = roi * (1 - alpha_mask) + colored_mask.astype(np.float32) * alpha_mask
+        blended = blended.astype(np.uint8)
+
+        # Place blended ROI back into result image
         result_img = base_img.copy()
         result_img[y_offset:y_offset+mask_h, x_offset:x_offset+mask_w] = blended
         return result_img
@@ -354,8 +378,8 @@ class MaskFinderGUI:
             self.zoom = fit_zoom
             self.offset_x = max(0, int((w - self.canvas_width / self.zoom) / 2))
             self.offset_y = max(0, int((h - self.canvas_height / self.zoom) / 2))
-        # Overlay mask in bottom right corner with 70% opacity
-        img_with_mask = self.overlay_mask_bottom_right_with_opacity(self.display_img, self.mask_img, opacity=0.7)
+        # Always overlay mask in bottom right corner before showing
+        img_with_mask = self.overlay_mask_bottom_right_with_transparency(self.display_img, self.mask_img)
         self.show_image(img_with_mask)
 
     # --- Zoom and Pan Methods ---
@@ -387,7 +411,8 @@ class MaskFinderGUI:
         rel_y = self.offset_y + mouse_y / old_zoom
         self.offset_x = max(0, min(int(rel_x - mouse_x / self.zoom), w - int(self.canvas_width / self.zoom)))
         self.offset_y = max(0, min(int(rel_y - mouse_y / self.zoom), h - int(self.canvas_height / self.zoom)))
-        self.show_image(self.display_img)
+        img_with_mask = self.overlay_mask_bottom_right_with_transparency(self.display_img, self.mask_img)
+        self.show_image(img_with_mask)
 
     def start_pan(self, event):
         self.last_mouse_pos = (event.x, event.y)
@@ -400,7 +425,8 @@ class MaskFinderGUI:
             self.offset_x = max(0, min(self.offset_x - int(dx / self.zoom), w - int(self.canvas_width / self.zoom)))
             self.offset_y = max(0, min(self.offset_y - int(dy / self.zoom), h - int(self.canvas_height / self.zoom)))
             self.last_mouse_pos = (event.x, event.y)
-            self.show_image(self.display_img)
+            img_with_mask = self.overlay_mask_bottom_right_with_transparency(self.display_img, self.mask_img)
+            self.show_image(img_with_mask)
 
     def end_pan(self, event):
         self.last_mouse_pos = None
