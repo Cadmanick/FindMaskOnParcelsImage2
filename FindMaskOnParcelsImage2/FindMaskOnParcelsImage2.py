@@ -5,6 +5,9 @@ import tkinter as tk
 from tkinter import filedialog, Button, Label, Entry
 import os
 import rasterio
+import itertools
+from math import comb
+from scipy.spatial import KDTree
 
 def get_pixel_size(path):
     with rasterio.open(path) as src:
@@ -209,14 +212,12 @@ class MaskFinderGUI:
             self.status_label.config(text="Images not loaded.")
             return
 
-        # Get threshold from entry
         try:
             self.match_thresh = float(self.threshold_entry.get())
             match_thresh = self.match_thresh
         except ValueError:
-            match_thresh = 0.1  # Default threshold for contour matching
+            match_thresh = 0.1
 
-        # Find contours in mask image
         ret_mask, mask_bin = cv2.threshold(self.mask_img, 127, 255, cv2.THRESH_BINARY)
         mask_contours, _ = cv2.findContours(mask_bin, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
         if not mask_contours:
@@ -230,46 +231,112 @@ class MaskFinderGUI:
             return
 
         preview_img = cv2.cvtColor(self.target_img.copy(), cv2.COLOR_GRAY2BGR)
-        candidate_bboxes = []
+        compound_candidates = []
 
-        # Get scaled mask size
-        mask_h, mask_w = self.mask_img.shape[:2]
-        tolerance = 0.2  # 20% tolerance
+        mask_area = sum(cv2.contourArea(cnt) for cnt in mask_contours)
+        tolerance = 0.2
 
-        for mask_contour in mask_contours:
-            for target_contour in target_contours:
-                score = cv2.matchShapes(mask_contour, target_contour, cv2.CONTOURS_MATCH_I3, 0.0)
-                if score < match_thresh:
-                    x, y, w, h = cv2.boundingRect(target_contour)
-                    # Filter by size
+        # Exclude contours smaller than 1/16 of mask area
+        min_candidate_area = mask_area / 16
+        filtered_target_contours = [
+            cnt for cnt in target_contours
+            if min_candidate_area <= cv2.contourArea(cnt) < mask_area
+        ]
+
+        n = len(filtered_target_contours)
+        print(f"Filtered contours: {n}")
+        for r in range(1, 4):
+            print(f"Combinations of {r}: {comb(n, r)}")
+
+        # Define color_map here
+        color_map = {
+            1: (0, 128, 0),
+            2: (0, 200, 0),
+            3: (0, 255, 0),
+        }
+
+        # Centroid-based grouping
+        def get_centroid(contour):
+            M = cv2.moments(contour)
+            if M["m00"] == 0:
+                return (0, 0)
+            return (int(M["m10"] / M["m00"]), int(M["m01"] / M["m00"]))
+
+        # Build centroids and KD-Tree
+        centroids = [get_centroid(cnt) for cnt in filtered_target_contours]
+        tree = KDTree(centroids)
+        MAX_DIST = 50
+
+        for i, centroid in enumerate(centroids):
+            neighbor_indices = tree.query_ball_point(centroid, MAX_DIST)
+            # Remove self
+            neighbor_indices = [idx for idx in neighbor_indices if idx != i]
+            # For pairs and triplets
+            for r in range(2, 4):
+                for combo in itertools.combinations(neighbor_indices, r-1):
+                    group_indices = [i] + list(combo)
+                    group = [filtered_target_contours[idx] for idx in group_indices]
+                    # ... process group as before ...
+
+                    color = color_map.get(r, (0, 255, 0))
+                    for cnt in group:
+                        cv2.drawContours(preview_img, [cnt], -1, color, thickness=2)
+
+                    combined = np.vstack(group)
+                    x, y, w, h = cv2.boundingRect(combined)
+                    mask_h, mask_w = self.mask_img.shape[:2]
                     if (
                         abs(w - mask_w) / mask_w < tolerance and
                         abs(h - mask_h) / mask_h < tolerance
                     ):
-                        # Fill contour in blue
-                        cv2.drawContours(preview_img, [target_contour], -1, (255, 0, 0), thickness=cv2.FILLED)
-                        # Outline contour in green
-                        cv2.drawContours(preview_img, [target_contour], -1, (0, 255, 0), thickness=2)
-                        candidate_bboxes.append((x, y, w, h))
+                        score = cv2.matchShapes(mask_contours[0], combined, cv2.CONTOURS_MATCH_I3, 0.0)
+                        if score < match_thresh:
+                            cv2.drawContours(preview_img, group, -1, (255, 0, 255), thickness=cv2.FILLED)
+                            cv2.rectangle(preview_img, (x, y), (x+w, y+h), (0, 255, 255), 2)
+                            compound_candidates.append((x, y, w, h, group))
 
-        self.candidate_bboxes = candidate_bboxes
+        # New centering logic
+        if compound_candidates:
+            best_candidate = min(compound_candidates, key=lambda c: c[2] * c[3])  # Minimize area
+            x, y, w, h = best_candidate[:4]
+            self.offset_x = max(0, x + w // 2 - self.canvas_width // 2)
+            self.offset_y = max(0, y + h // 2 - self.canvas_height // 2)
+
+        self.candidate_bboxes = [(x, y, w, h) for x, y, w, h, _ in compound_candidates]
         self.display_img = preview_img
         self.zoom_to_extents()
-        match_count = len(candidate_bboxes)
+        match_count = len(compound_candidates)
         if match_count == 0:
-            self.status_label.config(text=f"No matching contours found (threshold={match_thresh})")
+            self.status_label.config(text=f"No compound matches found (threshold={match_thresh})")
         else:
-            self.status_label.config(text=f"Found {match_count} matching contour(s) (threshold={match_thresh}, size tolerance={tolerance*100:.0f}%)")
+            self.status_label.config(text=f"Found {match_count} compound match(es) (threshold={match_thresh}, size tolerance={tolerance*100:.0f}%)")
+
+    def overlay_mask_bottom_right_with_opacity(self, base_img, mask_img, opacity=0.2):
+        """Overlay mask_img in bottom right corner of base_img with given opacity."""
+        if base_img is None or mask_img is None:
+            return base_img
+        mask_h, mask_w = mask_img.shape[:2]
+        base_h, base_w = base_img.shape[:2]
+        y_offset = base_h - mask_h
+        x_offset = base_w - mask_w
+        if y_offset < 0 or x_offset < 0:
+            return base_img  # Mask too large
+        # Prepare colored mask
+        colored_mask = np.zeros((mask_h, mask_w, 3), dtype=np.uint8)
+        colored_mask[:, :, 2] = mask_img  # Red channel
+        roi = base_img[y_offset:y_offset+mask_h, x_offset:x_offset+mask_w]
+        blended = cv2.addWeighted(roi, 1-opacity, colored_mask, opacity, 0)
+        result_img = base_img.copy()
+        result_img[y_offset:y_offset+mask_h, x_offset:x_offset+mask_w] = blended
+        return result_img
 
     def zoom_to_extents(self):
         """Zoom and center the current image to fit the canvas or all matched contours."""
         if self.display_img is None:
             return
         h, w = self.display_img.shape[:2]
-
         # If candidate bounding boxes are available, zoom to their union
         if hasattr(self, 'candidate_bboxes') and self.candidate_bboxes:
-            # Compute union bounding box
             xs = [bbox[0] for bbox in self.candidate_bboxes]
             ys = [bbox[1] for bbox in self.candidate_bboxes]
             ws = [bbox[0] + bbox[2] for bbox in self.candidate_bboxes]
@@ -277,9 +344,8 @@ class MaskFinderGUI:
             x_min, y_min = min(xs), min(ys)
             x_max, y_max = max(ws), max(hs)
             bw, bh = x_max - x_min, y_max - y_min
-
-            scale_x = self.canvas_width / bw
-            scale_y = self.canvas_height / bh
+            scale_x = self.canvas_width / max(bw, 1)
+            scale_y = self.canvas_height / max(bh, 1)
             self.zoom = min(scale_x, scale_y)
             self.offset_x = max(0, int(x_min - (self.canvas_width / self.zoom - bw) / 2))
             self.offset_y = max(0, int(y_min - (self.canvas_height / self.zoom - bh) / 2))
@@ -288,7 +354,9 @@ class MaskFinderGUI:
             self.zoom = fit_zoom
             self.offset_x = max(0, int((w - self.canvas_width / self.zoom) / 2))
             self.offset_y = max(0, int((h - self.canvas_height / self.zoom) / 2))
-        self.show_image(self.display_img)
+        # Overlay mask in bottom right corner with 70% opacity
+        img_with_mask = self.overlay_mask_bottom_right_with_opacity(self.display_img, self.mask_img, opacity=0.7)
+        self.show_image(img_with_mask)
 
     # --- Zoom and Pan Methods ---
     def zoom_event(self, event):
@@ -417,6 +485,22 @@ def scale_mask_to_target(mask_path, target_path):
     # Print pixel scale after conversion (now matches target)
     print(f"Mask pixel scale after scaling: {target_pixel_size}")
     return scaled_mask
+
+def are_contours_adjacent(contours, max_dist=2):
+    # Check if every contour in the group is adjacent to at least one other
+    for i in range(len(contours)):
+        adjacent = False
+        for j in range(len(contours)):
+            if i == j:
+                continue
+            # Compute min distance between points in contours[i] and contours[j]
+            dists = np.sqrt(np.sum((contours[i][:,0,:][:,None,:] - contours[j][:,0,:][None,:,:])**2, axis=2))
+            if np.min(dists) <= max_dist:
+                adjacent = True
+                break
+        if not adjacent:
+            return False
+    return True
 
 if __name__ == "__main__":
     root = tk.Tk()
