@@ -1,10 +1,37 @@
-
 import cv2
 import numpy as np
 from PIL import Image, ImageTk
 import tkinter as tk
 from tkinter import filedialog, Button, Label, Entry
 import os
+import rasterio
+
+def get_pixel_size(path):
+    with rasterio.open(path) as src:
+        pixel_width = src.transform.a
+        pixel_height = abs(src.transform.e)
+        return pixel_width, pixel_height
+
+def scale_mask_to_target(mask_path, target_path):
+    mask_pixel_size = get_pixel_size(mask_path)
+    target_pixel_size = get_pixel_size(target_path)
+
+    print(f"Mask pixel scale before scaling: {mask_pixel_size}")
+    print(f"Target pixel scale: {target_pixel_size}")
+
+    scale_x = mask_pixel_size[0] / target_pixel_size[0]
+    scale_y = mask_pixel_size[1] / target_pixel_size[1]
+
+    mask_img = cv2.imread(mask_path, cv2.IMREAD_GRAYSCALE)
+    new_size = (
+        int(mask_img.shape[1] * scale_x),
+        int(mask_img.shape[0] * scale_y)
+    )
+    scaled_mask = cv2.resize(mask_img, new_size, interpolation=cv2.INTER_NEAREST)
+
+    # Print pixel scale after conversion (now matches target)
+    print(f"Mask pixel scale after scaling: {target_pixel_size}")
+    return scaled_mask
 
 class MaskFinderGUI:
     def __init__(self, root):
@@ -41,13 +68,14 @@ class MaskFinderGUI:
         self.target_path_entry.pack(side=tk.TOP, padx=5, pady=2)
 
         # Buttons
-        self.load_mask_btn = Button(root, text="Load Mask Image", command=self.load_mask_image)
-        self.load_mask_btn.pack(side=tk.LEFT, padx=5, pady=5)
-        self.load_target_btn = Button(root, text="Load Target Image", command=self.load_target_image)
+        self.load_target_btn = Button(root, text="1-Load Target Image", command=self.load_target_image)
         self.load_target_btn.pack(side=tk.LEFT, padx=5, pady=5)
-        self.preprocess_btn = Button(root, text="Preprocess Target (Contours & Thicken)", command=self.preprocess_target_image)
-        self.preprocess_btn.pack(side=tk.LEFT, padx=5, pady=5)
-        self.find_btn = Button(root, text="Find Mask Candidates", command=self.find_and_highlight_mask_candidates)
+        self.load_mask_btn = Button(root, text="2-Load Mask Image", command=self.load_mask_image)
+        self.load_mask_btn.pack(side=tk.LEFT, padx=5, pady=5)
+
+        # self.preprocess_btn = Button(root, text="Preprocess Target (Contours & Thicken)", command=self.preprocess_target_image)
+        # self.preprocess_btn.pack(side=tk.LEFT, padx=5, pady=5)
+        self.find_btn = Button(root, text="3-Find Mask Candidates", command=self.find_and_highlight_mask_candidates)
         self.find_btn.pack(side=tk.LEFT, padx=5, pady=5)
         self.zoom_extents_btn = Button(root, text="Zoom to Extents", command=self.zoom_to_extents)
         self.zoom_extents_btn.pack(side=tk.LEFT, padx=5, pady=5)
@@ -116,13 +144,25 @@ class MaskFinderGUI:
                 return
             self.mask_path_entry.delete(0, tk.END)
             self.mask_path_entry.insert(0, file_path)
-        self.mask_img = cv2.imread(file_path, cv2.IMREAD_GRAYSCALE)
-        if self.mask_img is not None:
-            self.status_label.config(text=f"Loaded mask image: {file_path}")
-            self.display_img = self.mask_img
-            self.zoom_to_extents()
+        # Print pixel scale on load
+        try:
+            mask_pixel_size = get_pixel_size(file_path)
+            print(f"Mask pixel scale on load: {mask_pixel_size}")
+        except Exception as e:
+            print(f"Could not read mask pixel scale: {e}")
+        # Wait until target image is loaded
+        if self.target_img is not None:
+            target_path = self.target_path_entry.get()
+            self.mask_img = scale_mask_to_target(file_path, target_path)
+            self.overlay_mask_bottom_right()  # <-- Overlay mask after scaling
         else:
-            self.status_label.config(text="Failed to load mask image.")
+            self.mask_img = cv2.imread(file_path, cv2.IMREAD_GRAYSCALE)
+            if self.mask_img is not None:
+                self.status_label.config(text=f"Loaded mask image: {file_path}")
+                self.display_img = self.mask_img
+                self.zoom_to_extents()
+            else:
+                self.status_label.config(text="Failed to load mask image.")
 
     def load_target_image(self):
         file_path = self.target_path_entry.get()
@@ -133,9 +173,15 @@ class MaskFinderGUI:
                 return
             self.target_path_entry.delete(0, tk.END)
             self.target_path_entry.insert(0, file_path)
+        # Print pixel scale on load
+        try:
+            target_pixel_size = get_pixel_size(file_path)
+            print(f"Target pixel scale on load: {target_pixel_size}")
+        except Exception as e:
+            print(f"Could not read target pixel scale: {e}")
         img = cv2.imread(file_path, cv2.IMREAD_GRAYSCALE)
         if img is not None:
-            self.target_img = img   # Invert for processing  cv2.bitwise_not()
+            self.target_img = img
             self.status_label.config(text=f"Loaded target image: {file_path}")
             self.display_img = self.target_img
             self.zoom_to_extents()
@@ -184,27 +230,36 @@ class MaskFinderGUI:
             return
 
         preview_img = cv2.cvtColor(self.target_img.copy(), cv2.COLOR_GRAY2BGR)
-        match_count = 0
-        self.candidate_bboxes = []  # Store all candidate bounding boxes
+        candidate_bboxes = []
+
+        # Get scaled mask size
+        mask_h, mask_w = self.mask_img.shape[:2]
+        tolerance = 0.2  # 20% tolerance
 
         for mask_contour in mask_contours:
             for target_contour in target_contours:
                 score = cv2.matchShapes(mask_contour, target_contour, cv2.CONTOURS_MATCH_I3, 0.0)
                 if score < match_thresh:
-                    # Fill contour in blue
-                    cv2.drawContours(preview_img, [target_contour], -1, (255, 0, 0), thickness=cv2.FILLED)
-                    # Outline contour in green
-                    cv2.drawContours(preview_img, [target_contour], -1, (0, 255, 0), thickness=2)
-                    match_count += 1
                     x, y, w, h = cv2.boundingRect(target_contour)
-                    self.candidate_bboxes.append((x, y, w, h))
+                    # Filter by size
+                    if (
+                        abs(w - mask_w) / mask_w < tolerance and
+                        abs(h - mask_h) / mask_h < tolerance
+                    ):
+                        # Fill contour in blue
+                        cv2.drawContours(preview_img, [target_contour], -1, (255, 0, 0), thickness=cv2.FILLED)
+                        # Outline contour in green
+                        cv2.drawContours(preview_img, [target_contour], -1, (0, 255, 0), thickness=2)
+                        candidate_bboxes.append((x, y, w, h))
 
+        self.candidate_bboxes = candidate_bboxes
         self.display_img = preview_img
         self.zoom_to_extents()
+        match_count = len(candidate_bboxes)
         if match_count == 0:
             self.status_label.config(text=f"No matching contours found (threshold={match_thresh})")
         else:
-            self.status_label.config(text=f"Found {match_count} matching contour(s) (threshold={match_thresh})")
+            self.status_label.config(text=f"Found {match_count} matching contour(s) (threshold={match_thresh}, size tolerance={tolerance*100:.0f}%)")
 
     def zoom_to_extents(self):
         """Zoom and center the current image to fit the canvas or all matched contours."""
@@ -299,6 +354,69 @@ class MaskFinderGUI:
 
     def end_pan_shift(self, event):
         self.last_mouse_pos = None
+
+    def overlay_mask_bottom_right(self):
+        if self.target_img is None or self.mask_img is None:
+            return
+
+        # Ensure both images are grayscale and mask is scaled
+        mask_h, mask_w = self.mask_img.shape[:2]
+        target_h, target_w = self.target_img.shape[:2]
+
+        # Prepare color preview of target
+        preview_img = cv2.cvtColor(self.target_img.copy(), cv2.COLOR_GRAY2BGR)
+
+        # Overlay mask in bottom right corner
+        y_offset = target_h - mask_h
+        x_offset = target_w - mask_w
+
+        if y_offset < 0 or x_offset < 0:
+            self.status_label.config(text="Mask is larger than target image. Cannot overlay.")
+            self.display_img = self.mask_img
+            return
+
+        # Create colored mask (red channel)
+        colored_mask = np.zeros((mask_h, mask_w, 3), dtype=np.uint8)
+        colored_mask[:, :, 2] = self.mask_img  # Red channel
+
+        # Blend mask with target image (alpha blending)
+        alpha = 0.5
+        roi = preview_img[y_offset:y_offset+mask_h, x_offset:x_offset+mask_w]
+        blended = cv2.addWeighted(roi, 1-alpha, colored_mask, alpha, 0)
+        preview_img[y_offset:y_offset+mask_h, x_offset:x_offset+mask_w] = blended
+
+        self.display_img = preview_img
+        self.zoom_to_extents()
+        self.status_label.config(text="Mask overlaid in bottom right corner of target image.")
+
+def get_pixel_size(path):
+    with rasterio.open(path) as src:
+        # src.transform is an Affine object: (a, b, c, d, e, f)
+        # a = pixel width, e = pixel height (usually negative)
+           pixel_width = src.transform.a
+           pixel_height = abs(src.transform.e)
+           return pixel_width, pixel_height
+
+def scale_mask_to_target(mask_path, target_path):
+    mask_pixel_size = get_pixel_size(mask_path)
+    target_pixel_size = get_pixel_size(target_path)
+
+    print(f"Mask pixel scale before scaling: {mask_pixel_size}")
+    print(f"Target pixel scale: {target_pixel_size}")
+
+    scale_x = mask_pixel_size[0] / target_pixel_size[0]
+    scale_y = mask_pixel_size[1] / target_pixel_size[1]
+
+    mask_img = cv2.imread(mask_path, cv2.IMREAD_GRAYSCALE)
+    new_size = (
+        int(mask_img.shape[1] * scale_x),
+        int(mask_img.shape[0] * scale_y)
+    )
+    scaled_mask = cv2.resize(mask_img, new_size, interpolation=cv2.INTER_NEAREST)
+
+    # Print pixel scale after conversion (now matches target)
+    print(f"Mask pixel scale after scaling: {target_pixel_size}")
+    return scaled_mask
 
 if __name__ == "__main__":
     root = tk.Tk()
