@@ -70,6 +70,12 @@ class MaskFinderGUI:
         self.target_path_entry.insert(0, default_target_path)
         self.target_path_entry.pack(side=tk.TOP, padx=5, pady=2)
 
+        # --- Add rotation entry field ---
+        self.mask_rotation_entry = Entry(root, width=10)
+        self.mask_rotation_entry.insert(0, "16")  # Default rotation in degrees
+        self.mask_rotation_entry.pack(side=tk.TOP, padx=5, pady=2)
+        Label(root, text="Mask Rotation (degrees)").pack(side=tk.TOP, padx=5, pady=2)
+
         # Buttons
         self.load_target_btn = Button(root, text="1-Load Target Image", command=self.load_target_image)
         self.load_target_btn.pack(side=tk.LEFT, padx=5, pady=5)
@@ -87,7 +93,7 @@ class MaskFinderGUI:
         # Threshold entry
         self.threshold_entry = Entry(root)
         self.threshold_entry.pack(side=tk.TOP, padx=5, pady=2)
-        self.threshold_entry.insert(0, "0.8")  # Default threshold
+        self.threshold_entry.insert(0, "0.5")  # Default threshold
 
         # Bind zoom and pan events
         self.canvas.bind("<MouseWheel>", self.zoom_event)  # Windows
@@ -102,7 +108,7 @@ class MaskFinderGUI:
         self.canvas.bind("<ButtonRelease-1>", self.end_pan_shift)
 
     def show_image(self, img):
-        """Display the current image with zoom and pan, and overlay mask in visible viewport at correct scale."""
+        """Display the current image with zoom and pan."""
         if img is None:
             return
         self.display_img = img
@@ -120,31 +126,13 @@ class MaskFinderGUI:
             return
         resized = cv2.resize(cropped, (self.canvas_width, self.canvas_height), interpolation=cv2.INTER_AREA)
 
-        # Overlay mask in bottom right of the visible canvas, scaled by current zoom
-        if self.mask_img is not None:
-            mask_h, mask_w = self.mask_img.shape[:2]
-            scaled_mask_h = int(mask_h * self.zoom)
-            scaled_mask_w = int(mask_w * self.zoom)
-            overlay_h = min(scaled_mask_h, self.canvas_height)
-            overlay_w = min(scaled_mask_w, self.canvas_width)
-            mask_resized = cv2.resize(self.mask_img, (overlay_w, overlay_h), interpolation=cv2.INTER_NEAREST)
-            colored_mask = np.zeros((overlay_h, overlay_w, 3), dtype=np.uint8)
-            colored_mask[:, :, 2] = mask_resized
-            alpha = 0.5
-            y_offset = self.canvas_height - overlay_h
-            x_offset = self.canvas_width - overlay_w
-            roi = resized[y_offset:y_offset+overlay_h, x_offset:x_offset+overlay_w].astype(np.float32)
-            # Only blend where mask is nonzero
-            mask_fg = mask_resized > 0
-            blended = roi.copy()
-            blended[mask_fg] = roi[mask_fg] * (1 - alpha) + colored_mask[mask_fg].astype(np.float32) * alpha
-            resized[y_offset:y_offset+overlay_h, x_offset:x_offset+overlay_w] = blended.astype(np.uint8)
-
         # Convert for Tkinter
-        if len(resized.shape) == 2:
-            preview_rgb = cv2.cvtColor(resized, cv2.COLOR_GRAY2RGB)
+        img_with_mask = self.overlay_mask_bottom_right_with_transparency(resized, self.mask_img)
+        # Convert for Tkinter
+        if len(img_with_mask.shape) == 2:
+            preview_rgb = cv2.cvtColor(img_with_mask, cv2.COLOR_GRAY2RGB)
         else:
-            preview_rgb = cv2.cvtColor(resized, cv2.COLOR_BGR2RGB)
+            preview_rgb = cv2.cvtColor(img_with_mask, cv2.COLOR_BGR2RGB)
         img_pil = Image.fromarray(preview_rgb)
         self.tk_image = ImageTk.PhotoImage(img_pil)
         self.canvas.delete("all")
@@ -165,19 +153,57 @@ class MaskFinderGUI:
             print(f"Mask pixel scale on load: {mask_pixel_size}")
         except Exception as e:
             print(f"Could not read mask pixel scale: {e}")
+
+        # --- Get rotation value ---
+        try:
+            rotation_deg = float(self.mask_rotation_entry.get())
+        except Exception:
+            rotation_deg = 16.0  # fallback default
+
         # Wait until target image is loaded
         if self.target_img is not None:
             target_path = self.target_path_entry.get()
-            self.mask_img = scale_mask_to_target(file_path, target_path)
-            #self.overlay_mask_bottom_right()  # <-- Overlay mask after scaling
+            mask_img = cv2.imread(file_path, cv2.IMREAD_GRAYSCALE)
+            if mask_img is None:
+                self.status_label.config(text="Failed to load mask image.")
+                return
+            # --- Rotate mask image ---
+            mask_img = self.rotate_image(mask_img, rotation_deg)
+            # --- Scale mask to target ---
+            mask_img = self.scale_mask_to_target_array(mask_img, target_path)
+            self.mask_img = mask_img
+            self.zoom_to_extents()
         else:
-            self.mask_img = cv2.imread(file_path, cv2.IMREAD_GRAYSCALE)
-            if self.mask_img is not None:
+            mask_img = cv2.imread(file_path, cv2.IMREAD_GRAYSCALE)
+            if mask_img is not None:
+                mask_img = self.rotate_image(mask_img, rotation_deg)
+                self.mask_img = mask_img
                 self.status_label.config(text=f"Loaded mask image: {file_path}")
-                self.display_img = self.mask_img
                 self.zoom_to_extents()
             else:
                 self.status_label.config(text="Failed to load mask image.")
+
+    # --- Helper to rotate image ---
+    def rotate_image(self, img, angle):
+        h, w = img.shape[:2]
+        center = (w // 2, h // 2)
+        rot_mat = cv2.getRotationMatrix2D(center, angle, 1.0)
+        rotated = cv2.warpAffine(img, rot_mat, (w, h), flags=cv2.INTER_NEAREST, borderValue=0)
+        return rotated
+
+    # --- Helper to scale mask array to target ---
+    def scale_mask_to_target_array(self, mask_img, target_path):
+        mask_pixel_size = get_pixel_size(self.mask_path_entry.get())
+        target_pixel_size = get_pixel_size(target_path)
+        scale_x = mask_pixel_size[0] / target_pixel_size[0]
+        scale_y = mask_pixel_size[1] / target_pixel_size[1]
+        new_size = (
+            int(mask_img.shape[1] * scale_x),
+            int(mask_img.shape[0] * scale_y)
+        )
+        scaled_mask = cv2.resize(mask_img, new_size, interpolation=cv2.INTER_NEAREST)
+        print(f"Mask pixel scale after scaling: {target_pixel_size}")
+        return scaled_mask
 
     def load_target_image(self):
         file_path = self.target_path_entry.get()
@@ -246,7 +272,7 @@ class MaskFinderGUI:
         compound_candidates = []
 
         mask_area = sum(cv2.contourArea(cnt) for cnt in mask_contours)
-        tolerance = 0.2
+        tolerance = 0.314
 
         # Exclude contours smaller than 1/16 of mask area
         min_candidate_area = mask_area / 16
@@ -260,11 +286,18 @@ class MaskFinderGUI:
         for r in range(1, 4):
             print(f"Combinations of {r}: {comb(n, r)}")
 
-        # Define color_map here
+        # Define color_map for up to 10 constituent contours (extend as needed) GBR format for OpenCV drawing
         color_map = {
-            1: (0, 128, 0),
-            2: (0, 200, 0),
-            3: (0, 255, 0),
+            1: (0, 128, 0),      # dark green
+            2: (230, 20, 20),    # medium red
+            3: (255, 255, 0),    # test cyan bright green
+            4: (0, 255, 255),    # yellow
+            5: (255, 0, 255),    # magenta
+            6: (255, 128, 0),    # orange
+            7: (128, 0, 255),    # purple
+            8: (0, 128, 255),    # blue
+            9: (128, 128, 128),  # gray
+            10: (255, 255, 255), # white
         }
 
         # Centroid-based grouping
@@ -281,19 +314,15 @@ class MaskFinderGUI:
 
         for i, centroid in enumerate(centroids):
             neighbor_indices = tree.query_ball_point(centroid, MAX_DIST)
-            # Remove self
             neighbor_indices = [idx for idx in neighbor_indices if idx != i]
-            # For pairs and triplets
-            for r in range(2, 4):
+            # For pairs and triplets (extend r as needed)
+            for r in range(1, 4):
                 for combo in itertools.combinations(neighbor_indices, r-1):
                     group_indices = [i] + list(combo)
                     group = [filtered_target_contours[idx] for idx in group_indices]
-                    # ... process group as before ...
-
-                    color = color_map.get(r, (0, 255, 0))
+                    color = color_map.get(r, (255, 255, 255))  # fallback to white if not in map
                     for cnt in group:
                         cv2.drawContours(preview_img, [cnt], -1, color, thickness=2)
-
                     combined = np.vstack(group)
                     x, y, w, h = cv2.boundingRect(combined)
                     mask_h, mask_w = self.mask_img.shape[:2]
@@ -323,35 +352,54 @@ class MaskFinderGUI:
         else:
             self.status_label.config(text=f"Found {match_count} compound match(es) (threshold={match_thresh}, size tolerance={tolerance*100:.0f}%)")
 
-    def overlay_mask_bottom_right_with_transparency(self, base_img, mask_img):
-        """Overlay mask_img in bottom right corner of base_img using mask as transparency."""
-        if base_img is None or mask_img is None:
-            return base_img
+    def overlay_mask_bottom_right_with_transparency(self, viewport_img, mask_img, alpha=0.5):
+        """
+        Overlay mask_img in the bottom right corner of the viewport_img (the currently visible region),
+        scaling the mask according to the current zoom, and keeping it in view when zooming and panning.
+        """
+        if viewport_img is None or mask_img is None:
+            return viewport_img
+
+        # Scale mask to fit the viewport (canvas) size, keeping aspect ratio
         mask_h, mask_w = mask_img.shape[:2]
-        base_h, base_w = base_img.shape[:2]
-        y_offset = base_h - mask_h
-        x_offset = base_w - mask_w
-        if y_offset < 0 or x_offset < 0:
-            return base_img  # Mask too large
+        canvas_h, canvas_w = self.canvas_height, self.canvas_width
 
-        # Prepare colored mask (red channel)
-        colored_mask = np.zeros((mask_h, mask_w, 3), dtype=np.uint8)
-        colored_mask[:, :, 2] = mask_img  # Red channel
+        # Optionally, scale mask by zoom (or keep a fixed pixel size)
+        scaled_mask_h = int(mask_h * self.zoom)
+        scaled_mask_w = int(mask_w * self.zoom)
+        overlay_h = min(scaled_mask_h, canvas_h)
+        overlay_w = min(scaled_mask_w, canvas_w)
 
-        # Normalize mask to [0,1] for alpha channel
-        alpha_mask = mask_img.astype(np.float32) / 255.0
-        alpha_mask = np.expand_dims(alpha_mask, axis=2)  # shape (h, w, 1)
+        # Resize mask to overlay size
+        mask_resized = cv2.resize(mask_img, (overlay_w, overlay_h), interpolation=cv2.INTER_NEAREST)
+        colored_mask = np.zeros((overlay_h, overlay_w, 3), dtype=np.uint8)
+        colored_mask[:, :, 2] = mask_resized  # Red channel
 
-        # Get ROI from base image
-        roi = base_img[y_offset:y_offset+mask_h, x_offset:x_offset+mask_w].astype(np.float32)
+        # Prepare alpha mask (per-pixel mask * global alpha)
+        alpha_mask = (mask_resized.astype(np.float32) / 255.0) * alpha
+        alpha_mask = np.expand_dims(alpha_mask, axis=2)  # (h, w, 1)
+        alpha_mask = np.repeat(alpha_mask, 3, axis=2)    # (h, w, 3)
 
-        # Blend only where mask is nonzero (foreground)
+        # Overlay in bottom right of viewport
+        y_offset = canvas_h - overlay_h
+        x_offset = canvas_w - overlay_w
+
+        # Ensure viewport_img is color
+        if viewport_img.ndim == 2:
+            viewport_img_color = cv2.cvtColor(viewport_img, cv2.COLOR_GRAY2BGR)
+        else:
+            viewport_img_color = viewport_img.copy()
+
+        # Get ROI from viewport
+        roi = viewport_img_color[y_offset:y_offset+overlay_h, x_offset:x_offset+overlay_w].astype(np.float32)
+
+        # Blend
         blended = roi * (1 - alpha_mask) + colored_mask.astype(np.float32) * alpha_mask
         blended = blended.astype(np.uint8)
 
-        # Place blended ROI back into result image
-        result_img = base_img.copy()
-        result_img[y_offset:y_offset+mask_h, x_offset:x_offset+mask_w] = blended
+        # Place blended ROI back into viewport
+        result_img = viewport_img_color.copy()
+        result_img[y_offset:y_offset+overlay_h, x_offset:x_offset+overlay_w] = blended
         return result_img
 
     def zoom_to_extents(self):
@@ -466,7 +514,7 @@ class MaskFinderGUI:
 
         if y_offset < 0 or x_offset < 0:
             self.status_label.config(text="Mask is larger than target image. Cannot overlay.")
-            self.display_img = self.mask_img
+            #self.display_img = self.mask_img
             return
 
         # Create colored mask (red channel)
@@ -476,57 +524,66 @@ class MaskFinderGUI:
         # Blend mask with target image (alpha blending)
         alpha = 0.5
         roi = preview_img[y_offset:y_offset+mask_h, x_offset:x_offset+mask_w]
-        blended = cv2.addWeighted(roi, 1-alpha, colored_mask, alpha, 0)
+        if roi.ndim == 2:
+            roi = np.expand_dims(roi, axis=2)  # Convert grayscale to (h, w, 1)
+        alpha_mask = mask_img.astype(np.float32) / 255.0
+        alpha_mask = np.expand_dims(alpha_mask, axis=2)  # shape (h, w, 1)
+        if alpha_mask.shape[-1] == 1 and roi.shape[-1] == 3:
+            alpha_mask = np.repeat(alpha_mask, 3, axis=2)  # Make alpha_mask (h, w, 3)
+
+        # Blend only where mask is nonzero (foreground)
+        blended = roi * (1 - alpha_mask) + colored_mask.astype(np.float32) * alpha_mask
+        blended = blended.astype(np.uint8)
         preview_img[y_offset:y_offset+mask_h, x_offset:x_offset+mask_w] = blended
 
-        self.display_img = preview_img
+        #self.display_img = preview_img
         self.zoom_to_extents()
         self.status_label.config(text="Mask overlaid in bottom right corner of target image.")
 
-def get_pixel_size(path):
-    with rasterio.open(path) as src:
-        # src.transform is an Affine object: (a, b, c, d, e, f)
-        # a = pixel width, e = pixel height (usually negative)
-           pixel_width = src.transform.a
-           pixel_height = abs(src.transform.e)
-           return pixel_width, pixel_height
+    def get_pixel_size(path):
+        with rasterio.open(path) as src:
+            # src.transform is an Affine object: (a, b, c, d, e, f)
+            # a = pixel width, e = pixel height (usually negative)
+               pixel_width = src.transform.a
+               pixel_height = abs(src.transform.e)
+               return pixel_width, pixel_height
 
-def scale_mask_to_target(mask_path, target_path):
-    mask_pixel_size = get_pixel_size(mask_path)
-    target_pixel_size = get_pixel_size(target_path)
+    def scale_mask_to_target(mask_path, target_path):
+        mask_pixel_size = get_pixel_size(mask_path)
+        target_pixel_size = get_pixel_size(target_path)
 
-    print(f"Mask pixel scale before scaling: {mask_pixel_size}")
-    print(f"Target pixel scale: {target_pixel_size}")
+        print(f"Mask pixel scale before scaling: {mask_pixel_size}")
+        print(f"Target pixel scale: {target_pixel_size}")
 
-    scale_x = mask_pixel_size[0] / target_pixel_size[0]
-    scale_y = mask_pixel_size[1] / target_pixel_size[1]
+        scale_x = mask_pixel_size[0] / target_pixel_size[0]
+        scale_y = mask_pixel_size[1] / target_pixel_size[1]
 
-    mask_img = cv2.imread(mask_path, cv2.IMREAD_GRAYSCALE)
-    new_size = (
-        int(mask_img.shape[1] * scale_x),
-        int(mask_img.shape[0] * scale_y)
-    )
-    scaled_mask = cv2.resize(mask_img, new_size, interpolation=cv2.INTER_NEAREST)
+        mask_img = cv2.imread(mask_path, cv2.IMREAD_GRAYSCALE)
+        new_size = (
+            int(mask_img.shape[1] * scale_x),
+            int(mask_img.shape[0] * scale_y)
+        )
+        scaled_mask = cv2.resize(mask_img, new_size, interpolation=cv2.INTER_NEAREST)
 
-    # Print pixel scale after conversion (now matches target)
-    print(f"Mask pixel scale after scaling: {target_pixel_size}")
-    return scaled_mask
+        # Print pixel scale after conversion (now matches target)
+        print(f"Mask pixel scale after scaling: {target_pixel_size}")
+        return scaled_mask
 
-def are_contours_adjacent(contours, max_dist=2):
-    # Check if every contour in the group is adjacent to at least one other
-    for i in range(len(contours)):
-        adjacent = False
-        for j in range(len(contours)):
-            if i == j:
-                continue
-            # Compute min distance between points in contours[i] and contours[j]
-            dists = np.sqrt(np.sum((contours[i][:,0,:][:,None,:] - contours[j][:,0,:][None,:,:])**2, axis=2))
-            if np.min(dists) <= max_dist:
-                adjacent = True
-                break
-        if not adjacent:
-            return False
-    return True
+    def are_contours_adjacent(contours, max_dist=2):
+        # Check if every contour in the group is adjacent to at least one other
+        for i in range(len(contours)):
+            adjacent = False
+            for j in range(len(contours)):
+                if i == j:
+                    continue
+                # Compute min distance between points in contours[i] and contours[j]
+                dists = np.sqrt(np.sum((contours[i][:,0,:][:,None,:] - contours[j][:,0,:][None,:,:])**2, axis=2))
+                if np.min(dists) <= max_dist:
+                    adjacent = True
+                    break
+            if not adjacent:
+                return False
+        return True
 
 if __name__ == "__main__":
     root = tk.Tk()
